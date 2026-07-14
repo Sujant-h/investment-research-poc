@@ -4,16 +4,21 @@ import argparse
 import errno as _errno
 import json
 import mimetypes
+import os
 import re
-from dataclasses import asdict, dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .http_client import JsonHttpClient
 from .ingest import SUPPORTED_EXTENSIONS
 from .models import ResearchBrief
 from .pipeline import ResearchAssistant
+from .runtime import load_env_file
+from .symbol_extraction import LLMSymbolExtractor
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -96,6 +101,66 @@ COMPANY_SYMBOL_ALIASES = {
     "tesla": "TSLA",
 }
 
+KEYWORD_TOKEN_PATTERN = re.compile(r"\b\w+\b")
+# Fuellwoerter, Waehrungs- und Zeitangaben, die als News-Suchbegriff keinen
+# Mehrwert bringen. Firmennamen und Sachbegriffe bleiben bewusst erhalten.
+KEYWORD_STOPWORDS = {
+    "als",
+    "auf",
+    "aus",
+    "bewerte",
+    "bewerten",
+    "dem",
+    "den",
+    "der",
+    "des",
+    "die",
+    "das",
+    "dollar",
+    "ein",
+    "eine",
+    "einen",
+    "einer",
+    "eur",
+    "euro",
+    "fuer",
+    "für",
+    "im",
+    "in",
+    "investiere",
+    "investieren",
+    "ist",
+    "jahr",
+    "jahre",
+    "jahren",
+    "milliarde",
+    "milliarden",
+    "million",
+    "millionen",
+    "mit",
+    "monat",
+    "monate",
+    "monaten",
+    "nächste",
+    "nächsten",
+    "nächster",
+    "nächstes",
+    "ob",
+    "oder",
+    "prüfe",
+    "prüfen",
+    "soll",
+    "sollte",
+    "tausend",
+    "und",
+    "us",
+    "usd",
+    "von",
+    "zu",
+    "zum",
+    "zur",
+}
+
 NO_EVIDENCE_ERROR = "No relevant evidence found for the provided query."
 
 
@@ -103,6 +168,9 @@ NO_EVIDENCE_ERROR = "No relevant evidence found for the provided query."
 class AppContext:
     assistant: ResearchAssistant
     base_dir: Path
+    # Optionaler Override, damit Tests den LLM-Extractor offline halten koennen.
+    # None bedeutet: den echten build_symbol_extractor verwenden.
+    extractor_factory: Callable[["AppContext"], "LLMSymbolExtractor | None"] | None = field(default=None)
 
     @property
     def default_output_dir(self) -> Path:
@@ -126,6 +194,24 @@ def build_app_context(base_dir: Path | None = None) -> AppContext:
         candidate_base_dir = Path(str(base_dir).strip().rstrip('"'))
     resolved_base_dir = candidate_base_dir.resolve()
     return AppContext(assistant=ResearchAssistant(), base_dir=resolved_base_dir)
+
+
+def build_symbol_extractor(context: AppContext) -> LLMSymbolExtractor | None:
+    """Baut den LLM-Ticker-Extractor, falls ein OpenAI-Schluessel vorliegt.
+
+    Ohne Schluessel wird None zurueckgegeben und resolve_symbols faellt
+    kontrolliert auf die regelbasierte Ableitung zurueck.
+    """
+    config = context.assistant.config
+    load_env_file(config.resolve_env_file(context.base_dir))
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    client = JsonHttpClient(
+        timeout_seconds=config.request_timeout_seconds,
+        max_retries=config.max_retries,
+    )
+    return LLMSymbolExtractor(client, api_key, config)
 
 
 def parse_symbols(raw_value: str | None) -> list[str] | None:
@@ -199,13 +285,41 @@ def infer_symbols_from_query(query: str) -> list[str]:
     return inferred
 
 
+def build_keyword_query(query: str) -> str:
+    """Verdichtet eine Analysefrage zu einem News-tauglichen Suchbegriff.
+
+    Zahlen, Waehrungs- und Zeitangaben sowie Fuellwoerter werden entfernt,
+    Firmennamen und Sachbegriffe bleiben erhalten. Falls nach dem Filtern
+    nichts uebrig bleibt, werden die ersten Woerter der Frage zurueckgegeben,
+    damit nie ein leerer Suchbegriff entsteht.
+    """
+    kept: list[str] = []
+    seen: set[str] = set()
+    for token in KEYWORD_TOKEN_PATTERN.findall(query):
+        lowered = token.lower()
+        if len(token) <= 1 or lowered in seen:
+            continue
+        if any(char.isdigit() for char in token) or lowered in KEYWORD_STOPWORDS:
+            continue
+        kept.append(token)
+        seen.add(lowered)
+
+    result = " ".join(kept).strip()
+    if result:
+        return result
+
+    fallback = " ".join(query.split()[:6]).strip()
+    return fallback or query.strip()
+
+
 def resolve_symbols(
-    *, query: str, raw_symbols: str | None, symbol_mode: str
+    *, query: str, raw_symbols: str | None, symbol_mode: str, extractor: object | None = None
 ) -> tuple[list[str], str, str | None]:
     """Gibt (symbols, source, keywords) zurück.
 
-    keywords ist nur gesetzt wenn keine Ticker gefunden wurden und
-    eine Keyword-Suche als Fallback verwendet wird.
+    Reihenfolge im Automatikmodus: LLM-Extraktion (falls verfuegbar), sonst
+    die regelbasierte Ticker-Ableitung. keywords wird als News-Suchbegriff
+    verwendet, wenn kein Ticker eindeutig zugeordnet werden kann.
     """
     manual_symbols = parse_symbols(raw_symbols)
     if symbol_mode == "manual":
@@ -215,12 +329,22 @@ def resolve_symbols(
             "Bitte wähle mindestens ein Symbol aus oder wechsle zur automatischen Ableitung aus der Analysefrage."
         )
 
-    inferred_symbols = infer_symbols_from_query(query)
-    if inferred_symbols:
-        return inferred_symbols, "inferred", None
+    if extractor is not None:
+        try:
+            extraction = extractor.extract(query)
+        except Exception:
+            # LLM nicht erreichbar oder fehlerhaft → kontrollierter Rückfall auf Regeln.
+            pass
+        else:
+            if extraction.symbols:
+                return extraction.symbols, "llm", extraction.search_query
+            return [], "keyword", extraction.search_query or build_keyword_query(query)
 
-    # Kein Ticker erkannt → Keyword-Fallback: erste 6 Wörter der Frage als Suchbegriff
-    keywords = " ".join(query.split()[:6])
+    inferred_symbols = infer_symbols_from_query(query)
+    keywords = build_keyword_query(query)
+    if inferred_symbols:
+        return inferred_symbols, "inferred", keywords
+
     return [], "keyword", keywords
 
 
@@ -279,10 +403,13 @@ def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
                     default_provider=context.assistant.config.news_provider,
                 )
                 symbol_mode = normalize_symbol_mode(payload.get("symbol_mode"))
+                extractor_factory = context.extractor_factory or build_symbol_extractor
+                extractor = extractor_factory(context) if symbol_mode != "manual" else None
                 symbols, symbol_source, keywords = resolve_symbols(
                     query=query,
                     raw_symbols=str(payload.get("symbols", "")).strip() or None,
                     symbol_mode=symbol_mode,
+                    extractor=extractor,
                 )
 
                 brief = context.assistant.run(

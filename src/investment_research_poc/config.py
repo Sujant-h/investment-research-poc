@@ -13,6 +13,8 @@ class PipelineConfig:
     openai_model: str = "gpt-5.4"
     openai_reasoning_effort: str = "medium"
     openai_max_output_tokens: int = 1800
+    symbol_extraction_reasoning_effort: str = "low"
+    symbol_extraction_max_output_tokens: int = 600
     news_provider: str = "marketaux"
     news_language: str = "en"
     live_news_limit: int = 10

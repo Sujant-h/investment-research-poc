@@ -19,6 +19,9 @@ class WebAppTest(unittest.TestCase):
         self.test_root = Path(__file__).resolve().parent / "_artifacts" / str(uuid.uuid4())
         self.context = build_app_context(self.test_root)
         self.context.assistant.run = self._fake_run  # type: ignore[method-assign]
+        # Extractor offline halten: Tests decken die regelbasierte Ableitung ab,
+        # ohne echte OpenAI-Aufrufe aus der lokalen .env auszuloesen.
+        self.context.extractor_factory = lambda _context: None
         self.last_run_kwargs: dict[str, object] | None = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), create_handler(self.context))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -62,7 +65,7 @@ class WebAppTest(unittest.TestCase):
         output_dir = self.test_root / "output" / "web_run"
         self.assertEqual(status, 200)
         self.assertEqual(payload["brief"]["query"], "Assess Example Corp as an acquisition target")
-        self.assertEqual(payload["input_source"], "News-Provider-API")
+        self.assertEqual(payload["input_source"], "Nachrichtenquellen-API")
         self.assertEqual(payload["provider_name"], "marketaux")
         self.assertEqual(payload["requested_symbol_mode"], "manual")
         self.assertEqual(payload["resolved_symbols"], ["SAP", "MSFT"])
@@ -103,14 +106,14 @@ class WebAppTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(
             payload["error"],
-            "Bitte waehle mindestens ein Symbol aus oder wechsle zur automatischen Ableitung aus der Analysefrage.",
+            "Bitte wähle mindestens ein Symbol aus oder wechsle zur automatischen Ableitung aus der Analysefrage.",
         )
 
     def test_root_serves_frontend(self) -> None:
         status, payload, headers = self._request("GET", "/")
         self.assertEqual(status, 200)
         self.assertEqual(headers.get("Content-Type"), "text/html")
-        self.assertIn("Investment Research Workspace", payload)
+        self.assertIn("KI-Recherche-Arbeitsbereich", payload)
 
     def _fake_run(
         self,
@@ -119,6 +122,7 @@ class WebAppTest(unittest.TestCase):
         output_dir: Path | None = None,
         input_path: Path | None = None,
         symbols: list[str] | None = None,
+        keywords: str | None = None,
         include_live_news: bool = False,
         provider_name: str | None = None,
         use_openai: bool = True,
@@ -129,6 +133,7 @@ class WebAppTest(unittest.TestCase):
             "output_dir": output_dir,
             "input_path": input_path,
             "symbols": symbols,
+            "keywords": keywords,
             "include_live_news": include_live_news,
             "provider_name": provider_name,
             "use_openai": use_openai,
