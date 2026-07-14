@@ -1,0 +1,27 @@
+[project]
+name = "investment-research-poc"
+version = "0.1.0"
+description = "Proof of concept for an AI-assisted research workflow in investment banking."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "Codex" }
+]
+dependencies = []
+
+[project.scripts]
+investment-research-poc = "investment_research_poc.cli:main"
+investment-research-web = "investment_research_poc.webapp:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+investment_research_poc = ["web/*"]

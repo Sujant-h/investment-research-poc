@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Digitale Transformation – KI-Recherche-Arbeitsbereich</title>
+    <meta
+      name="description"
+      content="Prototyp: KI-gestützter Recherche-Assistent für Investmentbanking – RAG, Human-in-the-Loop, modulare Architektur."
+    >
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M4 16.5 9 11l3.5 3.5L20 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M15 7h5v5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <h1>KI-Recherche-Arbeitsbereich</h1>
+        </div>
+        <span class="badge health-badge" id="health-indicator">Server wird geprüft</span>
+      </header>
+
+      <main class="workspace-grid">
+        <aside class="control-rail">
+          <section class="control-card stack-lg">
+            <h3>Analyse vorbereiten</h3>
+
+            <form id="research-form" class="stack-lg" novalidate>
+              <div class="form-section stack-md">
+                <label class="field">
+                  <span>Analysefrage</span>
+                  <textarea
+                    id="query"
+                    name="query"
+                    rows="5"
+                    placeholder="Beispiel: Soll ich in ServiceNow investieren?"
+                    required
+                  ></textarea>
+                  <small>Präzise Fragen führen zu besserer Evidenz und klareren Empfehlungen.</small>
+                </label>
+              </div>
+
+              <div class="form-section stack-md" aria-labelledby="suggestion-heading">
+                <h4 id="suggestion-heading">Beispielabfragen</h4>
+                <div class="stack-sm" id="query-suggestions"></div>
+              </div>
+
+              <div class="form-section stack-md" aria-labelledby="settings-heading">
+                <h4 id="settings-heading">Einstellungen</h4>
+
+                <label class="field">
+                  <span>Nachrichtenquelle</span>
+                  <select id="provider_name" name="provider_name"></select>
+                </label>
+
+                <div class="stack-sm">
+                  <div class="field-header">
+                    <span class="field-title">Symbol-Einstellung</span>
+                    <small>Automatisch oder manuell.</small>
+                  </div>
+                  <div id="symbol-mode-options" class="choice-grid" role="radiogroup" aria-label="Symbol-Einstellung"></div>
+                </div>
+
+                <div class="panel-muted stack-sm" id="symbol-picker-panel" hidden>
+                  <div class="section-header">
+                    <h4>Symbole auswählen</h4>
+                    <button class="button-secondary" id="clear-symbols" type="button">Leeren</button>
+                  </div>
+                  <label class="field">
+                    <span>Eigenes Symbol eingeben</span>
+                    <div class="custom-ticker-row">
+                      <input
+                        type="text"
+                        id="custom-ticker-input"
+                        placeholder="z. B. BMW, BNTX, DHL.DE"
+                        autocomplete="off"
+                        spellcheck="false"
+                      >
+                      <button class="button-secondary" id="add-custom-ticker" type="button">Hinzufügen</button>
+                    </div>
+                    <small>Ticker kommagetrennt oder einzeln hinzufügen.</small>
+                  </label>
+                  <label class="field">
+                    <span>Aus Liste auswählen</span>
+                    <select id="symbols" name="symbols" multiple size="6" aria-describedby="symbols-help"></select>
+                    <small id="symbols-help">Mindestens ein Symbol erforderlich.</small>
+                  </label>
+                </div>
+
+                <p class="subtle-copy" id="symbol-mode-note">
+                  Im Automatikmodus werden Symbole für jede Analyse aus der Frage abgeleitet.
+                </p>
+              </div>
+
+              <div class="form-footer">
+                <p id="form-message" class="form-message" aria-live="polite"></p>
+                <button id="submit-button" class="button-primary" type="submit">
+                  Analyse starten
+                </button>
+              </div>
+            </form>
+
+            <section class="run-progress" id="run-progress" hidden aria-live="polite" aria-label="Analyse-Fortschritt">
+              <ol class="run-stages" id="run-stages">
+                <li class="run-stage" data-stage="ingestion">
+                  <span class="stage-label">Daten &amp; Nachrichten werden geladen</span>
+                  <span class="stage-status"></span>
+                </li>
+                <li class="run-stage" data-stage="chunking">
+                  <span class="stage-label">Dokumente werden zerlegt</span>
+                  <span class="stage-status"></span>
+                </li>
+                <li class="run-stage" data-stage="retrieval">
+                  <span class="stage-label">Relevante Passagen werden abgerufen</span>
+                  <span class="stage-status"></span>
+                </li>
+                <li class="run-stage" data-stage="analysis">
+                  <span class="stage-label">KI-Analyse</span>
+                  <span class="stage-status"></span>
+                </li>
+                <li class="run-stage" data-stage="reporting">
+                  <span class="stage-label">Analysebericht wird erstellt</span>
+                  <span class="stage-status"></span>
+                </li>
+              </ol>
+            </section>
+          </section>
+        </aside>
+
+        <section class="results-stage">
+          <section class="results-empty" id="results-empty">
+            <div class="empty-shell">
+              <span class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M14 3v4a1 1 0 0 0 1 1h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M5 3h9l5 5v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  <path d="M8 12h8M8 16h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                </svg>
+              </span>
+              <h3>Noch kein Analysebericht</h3>
+              <p class="subtle-copy">
+                Starte eine Analyse – Live-Nachrichten werden automatisch
+                verarbeitet und zu einer strukturierten Entscheidungsvorlage aufbereitet.
+              </p>
+            </div>
+          </section>
+
+          <section class="summary-card" id="results-panel" hidden>
+            <div class="results-header">
+              <div class="stack-xs">
+                <p class="eyebrow">Analysebericht</p>
+                <h2 id="result-title">Aktueller Analysebericht</h2>
+              </div>
+              <p id="result-output-path" class="path-text"></p>
+            </div>
+
+            <div class="summary-grid">
+              <article class="result-section stack-sm">
+                <h3>Management-Zusammenfassung</h3>
+                <p id="executive-summary"></p>
+              </article>
+              <article class="result-section stack-sm">
+                <h3>Empfehlung</h3>
+                <p id="recommendation"></p>
+              </article>
+            </div>
+
+            <article class="result-section stack-sm">
+              <div class="section-header">
+                <h3>Sentiment</h3>
+                <span id="sentiment-badge" class="badge badge-outline sentiment-badge"></span>
+              </div>
+              <p class="metric-line">Wert <strong id="sentiment-score"></strong></p>
+              <div class="summary-grid-inner">
+                <div class="stack-xs">
+                  <h4>Positive Signale</h4>
+                  <ul id="positive-terms" class="token-list"></ul>
+                </div>
+                <div class="stack-xs">
+                  <h4>Negative Signale</h4>
+                  <ul id="negative-terms" class="token-list"></ul>
+                </div>
+              </div>
+            </article>
+
+            <div class="summary-grid">
+              <article class="result-section stack-sm result-section--opportunity">
+                <h3>Chancen</h3>
+                <ul id="opportunities" class="bullet-list"></ul>
+              </article>
+              <article class="result-section stack-sm result-section--risk">
+                <h3>Risiken</h3>
+                <ul id="risks" class="bullet-list"></ul>
+              </article>
+            </div>
+
+            <article class="result-section stack-sm">
+              <div class="section-header">
+                <h3>Wichtigste Evidenz</h3>
+                <p id="evidence-count" class="subtle-copy"></p>
+              </div>
+              <div id="evidence-list" class="stack-sm"></div>
+            </article>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <template id="evidence-template">
+      <article class="evidence-card stack-sm">
+        <div class="section-header">
+          <div class="stack-xs">
+            <h4 class="evidence-title"></h4>
+            <p class="evidence-meta"></p>
+          </div>
+          <span class="evidence-score subtle-copy"></span>
+        </div>
+        <p class="evidence-text"></p>
+      </article>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

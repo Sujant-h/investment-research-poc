@@ -1,0 +1,18 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "C:\\Users\\Sujanth\\Documents\\Digitale Transformation\\run-web.cmd",
+      "runtimeArgs": [],
+      "port": 8080
+    },
+    {
+      "name": "web-preview",
+      "runtimeExecutable": "scripts\\run-web.cmd",
+      "runtimeArgs": [],
+      "autoPort": false,
+      "port": 8099
+    }
+  ]
+}
