@@ -77,6 +77,22 @@ Die Web-App:
 - kann optional Live-News und OpenAI aktivieren
 - schreibt weiterhin `research_brief.md` und `research_brief.json` in den gewaehlten Ausgabeordner
 
+## Deployment (oeffentliche Subdomain)
+
+Fuer den produktiven Betrieb unter einer eigenen Subdomain (z. B.
+`invest.suthaharan.de`) liegt eine Docker-Compose-Konfiguration bei. Der
+Container wird nur auf `127.0.0.1` veroeffentlicht; das globale nginx des VPS
+terminiert TLS und leitet die Subdomain als Reverse-Proxy weiter:
+
+```bash
+cp .env.example .env   # API-Keys, APP_PORT und Rate-Limits eintragen
+docker compose up -d --build
+```
+
+Details, DNS- und nginx-Einrichtung sowie der Kostenschutz (Rate-Limiting je IP
+und globales Tageslimit fuer den bezahlten API-Verbrauch) sind in
+[DEPLOYMENT.md](DEPLOYMENT.md) beschrieben.
+
 ## Methodischer Aufbau
 
 1. Dokumente werden aus einem Eingabeverzeichnis geladen.

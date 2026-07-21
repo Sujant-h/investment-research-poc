@@ -6,6 +6,9 @@ import json
 import mimetypes
 import os
 import re
+import threading
+import time
+from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from http import HTTPStatus
@@ -163,6 +166,97 @@ KEYWORD_STOPWORDS = {
 
 NO_EVIDENCE_ERROR = "No relevant evidence found for the provided query."
 
+# Kostenschutz fuer den oeffentlichen Demo-Betrieb: jeder /api/research-Aufruf
+# loest bezahlte OpenAI- und News-API-Anfragen aus. Die Werte lassen sich per
+# Umgebungsvariable ueberschreiben; <= 0 deaktiviert die jeweilige Grenze.
+RATE_LIMIT_TOO_MANY_IP = (
+    "Zu viele Anfragen von dieser Adresse. Bitte warte einen Moment und versuche es erneut."
+)
+RATE_LIMIT_DAILY_EXHAUSTED = (
+    "Das tägliche Demo-Kontingent ist aufgebraucht. Diese öffentliche Demo ist bewusst begrenzt – "
+    "bitte versuche es morgen erneut."
+)
+
+
+def _int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        return int(raw_value.strip())
+    except ValueError:
+        return default
+
+
+@dataclass(slots=True)
+class RateLimitConfig:
+    """Grenzwerte fuer den oeffentlichen Demo-Endpunkt."""
+
+    per_ip_limit: int = 8
+    per_ip_window_seconds: int = 3600
+    global_daily_limit: int = 150
+
+    @classmethod
+    def from_env(cls) -> "RateLimitConfig":
+        # Literale Defaults, weil slots=True keinen Zugriff auf Klassen-Defaults
+        # (cls.per_ip_limit liefert einen Slot-Deskriptor) erlaubt.
+        return cls(
+            per_ip_limit=_int_env("RATE_LIMIT_PER_IP", 8),
+            per_ip_window_seconds=_int_env("RATE_LIMIT_WINDOW_SECONDS", 3600),
+            global_daily_limit=_int_env("RATE_LIMIT_GLOBAL_PER_DAY", 150),
+        )
+
+
+class RateLimiter:
+    """Thread-sicheres In-Memory-Rate-Limiting.
+
+    Kombiniert ein gleitendes Fenster pro IP mit einer globalen Tagesobergrenze,
+    damit ein einzelner Besucher – und alle Besucher zusammen – kein unbegrenztes
+    Budget an bezahlten API-Aufrufen verbrauchen koennen.
+    """
+
+    def __init__(self, config: RateLimitConfig) -> None:
+        self.config = config
+        self._lock = threading.Lock()
+        self._ip_hits: dict[str, deque[float]] = defaultdict(deque)
+        self._day_key: str | None = None
+        self._day_count = 0
+
+    def check(self, client_ip: str, *, now: float | None = None) -> tuple[bool, str | None]:
+        current = time.time() if now is None else now
+        with self._lock:
+            if self.config.global_daily_limit > 0:
+                today = time.strftime("%Y-%m-%d", time.gmtime(current))
+                if today != self._day_key:
+                    self._day_key = today
+                    self._day_count = 0
+                if self._day_count >= self.config.global_daily_limit:
+                    return False, RATE_LIMIT_DAILY_EXHAUSTED
+
+            if self.config.per_ip_limit > 0:
+                hits = self._ip_hits[client_ip]
+                cutoff = current - self.config.per_ip_window_seconds
+                while hits and hits[0] < cutoff:
+                    hits.popleft()
+                if len(hits) >= self.config.per_ip_limit:
+                    if not hits:
+                        self._ip_hits.pop(client_ip, None)
+                    return False, RATE_LIMIT_TOO_MANY_IP
+                hits.append(current)
+                self._prune_locked(cutoff)
+
+            if self.config.global_daily_limit > 0:
+                self._day_count += 1
+            return True, None
+
+    def _prune_locked(self, cutoff: float) -> None:
+        # Verhindert unbegrenztes Wachstum, wenn viele verschiedene IPs anfragen.
+        if len(self._ip_hits) <= 4096:
+            return
+        stale = [ip for ip, hits in self._ip_hits.items() if not hits or hits[-1] < cutoff]
+        for ip in stale:
+            self._ip_hits.pop(ip, None)
+
 
 @dataclass(slots=True)
 class AppContext:
@@ -171,6 +265,9 @@ class AppContext:
     # Optionaler Override, damit Tests den LLM-Extractor offline halten koennen.
     # None bedeutet: den echten build_symbol_extractor verwenden.
     extractor_factory: Callable[["AppContext"], "LLMSymbolExtractor | None"] | None = field(default=None)
+    # Kostenschutz fuer den oeffentlichen Betrieb. None => Konfiguration aus den
+    # Umgebungsvariablen ableiten (siehe RateLimitConfig.from_env).
+    rate_limiter: "RateLimiter | None" = field(default=None)
 
     @property
     def default_output_dir(self) -> Path:
@@ -372,8 +469,18 @@ def build_defaults_payload(context: AppContext) -> dict[str, object]:
 
 
 def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
+    rate_limiter = context.rate_limiter or RateLimiter(RateLimitConfig.from_env())
+
     class ResearchRequestHandler(BaseHTTPRequestHandler):
         server_version = "InvestmentResearchWeb/0.1"
+
+        def _client_ip(self) -> str:
+            # Hinter dem Caddy-Reverse-Proxy steht die echte IP im
+            # X-Forwarded-For-Header (erste Adresse der Kette).
+            forwarded = self.headers.get("X-Forwarded-For", "")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+            return self.client_address[0] if self.client_address else "unknown"
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -389,6 +496,11 @@ def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
             parsed = urlparse(self.path)
             if parsed.path != "/api/research":
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found."})
+                return
+
+            allowed, limit_message = rate_limiter.check(self._client_ip())
+            if not allowed:
+                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": limit_message})
                 return
 
             try:
@@ -512,9 +624,20 @@ def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the local investment research web app.")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="Host interface to bind to.")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to listen on.")
+    parser = argparse.ArgumentParser(description="Run the investment research web app.")
+    # Defaults kommen aus der Umgebung (HOST/PORT), damit derselbe Befehl lokal
+    # (127.0.0.1) und im Container (0.0.0.0, Plattform-PORT) funktioniert.
+    parser.add_argument(
+        "--host",
+        default=os.getenv("HOST", DEFAULT_HOST),
+        help="Host interface to bind to (env: HOST).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=_int_env("PORT", DEFAULT_PORT),
+        help="Port to listen on (env: PORT).",
+    )
     parser.add_argument(
         "--base-dir",
         type=Path,
@@ -527,6 +650,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     context = build_app_context(args.base_dir)
+    # .env fruehzeitig laden, damit Rate-Limit- und API-Konfiguration bereitstehen.
+    load_env_file(context.assistant.config.resolve_env_file(context.base_dir))
     handler = create_handler(context)
     server = ThreadingHTTPServer((args.host, args.port), handler)
     print(f"Investment Research web app available at http://{args.host}:{args.port}")
