@@ -20,6 +20,14 @@ services:
     # never exposed directly to the internet. Change the host port via APP_PORT.
     ports:
       - "127.0.0.1:${APP_PORT:-8080}:8080"
+    # Ressourcenobergrenzen: ein Ausreisser (z. B. grosse Upstream-Antwort) darf
+    # den VPS nicht destabilisieren. Compose v2 beachtet deploy.resources.limits
+    # auch fuer "docker compose up" (kein Swarm noetig).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
     healthcheck:
       test:
         - CMD

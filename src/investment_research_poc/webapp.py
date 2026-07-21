@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import errno as _errno
+import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import re
 import threading
 import time
+import traceback
 from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -24,10 +27,18 @@ from .runtime import load_env_file
 from .symbol_extraction import LLMSymbolExtractor
 
 
+LOGGER = logging.getLogger("investment_research_poc.web")
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_OUTPUT_DIR = Path("output") / "web_run"
 STATIC_DIR = Path(__file__).with_name("web")
+
+# Die Analyse-Payload ist winzig (Frage + optionale Symbole). Ein hartes Limit
+# schuetzt vor Speicher-Erschoepfung durch ein grosses Content-Length.
+MAX_REQUEST_BODY_BYTES = 64 * 1024
+# Idle-/Slow-Client-Timeout pro Verbindung (Schutz vor Slowloris-artigen Verbindungen).
+REQUEST_TIMEOUT_SECONDS = 30
 AVAILABLE_NEWS_PROVIDERS = ("marketaux", "alpha_vantage")
 SYMBOL_SELECTION_MODES = (
     {
@@ -176,6 +187,16 @@ RATE_LIMIT_DAILY_EXHAUSTED = (
     "Das tägliche Demo-Kontingent ist aufgebraucht. Diese öffentliche Demo ist bewusst begrenzt – "
     "bitte versuche es morgen erneut."
 )
+# Generische Meldung fuer unerwartete Serverfehler: interne/Upstream-Fehlertexte
+# werden nur serverseitig geloggt, nie an den Client zurueckgegeben.
+INTERNAL_ERROR_MESSAGE = (
+    "Es ist ein interner Fehler aufgetreten. Bitte versuche es später erneut."
+)
+PAYLOAD_TOO_LARGE_MESSAGE = "Die Anfrage ist zu groß."
+
+
+class PayloadTooLarge(Exception):
+    """Wird ausgeloest, wenn der Request-Body das erlaubte Limit ueberschreitet."""
 
 
 def _int_env(name: str, default: int) -> int:
@@ -454,6 +475,23 @@ def localize_error_message(message: str) -> str:
     return message
 
 
+_PROVIDER_KEY_ENV = {
+    "marketaux": "MARKETAUX_API_TOKEN",
+    "alpha_vantage": "ALPHA_VANTAGE_API_KEY",
+}
+
+
+def missing_required_keys(context: AppContext) -> list[str]:
+    """Namen der fuer den Live-Betrieb noetigen, aber nicht gesetzten Env-Variablen.
+
+    Prueft den OpenAI-Schluessel und den Token des Standard-News-Providers. Wird
+    beim Start (Warnung) und vom /api/health-Endpunkt (Readiness) genutzt.
+    """
+    provider = context.assistant.config.news_provider
+    required = ["OPENAI_API_KEY", _PROVIDER_KEY_ENV.get(provider, "MARKETAUX_API_TOKEN")]
+    return [name for name in required if not os.getenv(name)]
+
+
 def build_defaults_payload(context: AppContext) -> dict[str, object]:
     return {
         "default_output_path": str(context.default_output_dir),
@@ -473,13 +511,22 @@ def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
 
     class ResearchRequestHandler(BaseHTTPRequestHandler):
         server_version = "InvestmentResearchWeb/0.1"
+        # Verbindungs-Timeout, damit langsame/haengende Clients keine Threads binden.
+        timeout = REQUEST_TIMEOUT_SECONDS
 
         def _client_ip(self) -> str:
-            # Hinter dem Caddy-Reverse-Proxy steht die echte IP im
-            # X-Forwarded-For-Header (erste Adresse der Kette).
+            # Hinter dem nginx-Reverse-Proxy ueberschreibt der Proxy den
+            # X-Forwarded-For-Header mit der echten Client-IP (siehe DEPLOYMENT.md).
+            # Wir nehmen die *letzte* Adresse der Kette (die vom vertrauenswuerdigen
+            # Proxy angehaengte), damit ein vom Client selbst gesetztes XFF das
+            # Rate-Limiting nicht aushebeln kann, und validieren sie als IP.
             forwarded = self.headers.get("X-Forwarded-For", "")
             if forwarded:
-                return forwarded.split(",")[0].strip()
+                candidate = forwarded.split(",")[-1].strip()
+                try:
+                    return str(ipaddress.ip_address(candidate))
+                except ValueError:
+                    pass
             return self.client_address[0] if self.client_address else "unknown"
 
         def do_GET(self) -> None:
@@ -488,7 +535,13 @@ def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.OK, build_defaults_payload(context))
                 return
             if parsed.path == "/api/health":
-                self._send_json(HTTPStatus.OK, {"status": "ok"})
+                # "ok" bleibt fuer den Container-Healthcheck erhalten; "ready"
+                # spiegelt, ob die Live-API-Schluessel konfiguriert sind, damit ein
+                # fehlkonfiguriertes Deployment sichtbar wird, ohne Geld auszugeben.
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"status": "ok", "ready": not missing_required_keys(context)},
+                )
                 return
             self._serve_static(parsed.path)
 
@@ -498,11 +551,16 @@ def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found."})
                 return
 
-            allowed, limit_message = rate_limiter.check(self._client_ip())
+            client_ip = self._client_ip()
+            started_at = time.monotonic()
+
+            allowed, limit_message = rate_limiter.check(client_ip)
             if not allowed:
+                self._log_research(client_ip, HTTPStatus.TOO_MANY_REQUESTS, started_at)
                 self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": limit_message})
                 return
 
+            symbol_source = "-"
             try:
                 payload = self._read_json_body()
                 query = str(payload.get("query", "")).strip()
@@ -517,12 +575,13 @@ def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
                 symbol_mode = normalize_symbol_mode(payload.get("symbol_mode"))
                 extractor_factory = context.extractor_factory or build_symbol_extractor
                 extractor = extractor_factory(context) if symbol_mode != "manual" else None
-                symbols, symbol_source, keywords = resolve_symbols(
+                symbols, resolved_symbol_source, keywords = resolve_symbols(
                     query=query,
                     raw_symbols=str(payload.get("symbols", "")).strip() or None,
                     symbol_mode=symbol_mode,
                     extractor=extractor,
                 )
+                symbol_source = resolved_symbol_source
 
                 brief = context.assistant.run(
                     query=query,
@@ -535,19 +594,40 @@ def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
                     use_openai=True,
                     base_dir=context.base_dir,
                 )
+            except PayloadTooLarge:
+                self._log_research(client_ip, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, started_at)
+                self._send_json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": PAYLOAD_TOO_LARGE_MESSAGE}
+                )
+                return
             except FileNotFoundError as exc:
+                self._log_research(client_ip, HTTPStatus.BAD_REQUEST, started_at)
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                 return
             except ValueError as exc:
+                self._log_research(client_ip, HTTPStatus.BAD_REQUEST, started_at)
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": localize_error_message(str(exc))})
                 return
             except json.JSONDecodeError:
+                self._log_research(client_ip, HTTPStatus.BAD_REQUEST, started_at)
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Malformed JSON payload."})
                 return
-            except Exception as exc:  # pragma: no cover - defensive branch
-                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            except Exception:
+                # Vollstaendigen Traceback nur serverseitig loggen; dem Client wird
+                # eine generische Meldung zurueckgegeben (keine internen Details).
+                LOGGER.error(
+                    "research error ip=%s symbol_source=%s\n%s",
+                    client_ip,
+                    symbol_source,
+                    traceback.format_exc(),
+                )
+                self._log_research(client_ip, HTTPStatus.INTERNAL_SERVER_ERROR, started_at)
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR, {"error": INTERNAL_ERROR_MESSAGE}
+                )
                 return
 
+            self._log_research(client_ip, HTTPStatus.OK, started_at, symbol_source=symbol_source)
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -565,12 +645,33 @@ def create_handler(context: AppContext) -> type[BaseHTTPRequestHandler]:
             )
 
         def log_message(self, format: str, *args: object) -> None:
+            # Stdlib-Zugriffslog unterdruecken; wir loggen /api/research gezielt
+            # ueber _log_research (strukturiert, ueber den Modul-Logger).
             return
+
+        def _log_research(
+            self,
+            client_ip: str,
+            status: HTTPStatus,
+            started_at: float,
+            *,
+            symbol_source: str = "-",
+        ) -> None:
+            duration_ms = (time.monotonic() - started_at) * 1000.0
+            LOGGER.info(
+                "research ip=%s status=%d symbol_source=%s duration_ms=%.0f",
+                client_ip,
+                int(status),
+                symbol_source,
+                duration_ms,
+            )
 
         def _read_json_body(self) -> dict[str, object]:
             content_length = int(self.headers.get("Content-Length", "0"))
             if content_length <= 0:
                 return {}
+            if content_length > MAX_REQUEST_BODY_BYTES:
+                raise PayloadTooLarge
             raw_body = self.rfile.read(content_length)
             return json.loads(raw_body.decode("utf-8"))
 
@@ -648,13 +749,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     args = build_parser().parse_args()
     context = build_app_context(args.base_dir)
     # .env fruehzeitig laden, damit Rate-Limit- und API-Konfiguration bereitstehen.
     load_env_file(context.assistant.config.resolve_env_file(context.base_dir))
+
+    # Fehlende Schluessel beim Start deutlich melden: sonst startet der Server und
+    # scheitert erst pro Anfrage (oder degradiert stillschweigend zur Regel-Analyse).
+    missing = missing_required_keys(context)
+    if missing:
+        LOGGER.warning(
+            "Missing API keys: %s. Live analysis will fail or fall back until these are set.",
+            ", ".join(missing),
+        )
+
     handler = create_handler(context)
     server = ThreadingHTTPServer((args.host, args.port), handler)
-    print(f"Investment Research web app available at http://{args.host}:{args.port}")
+    LOGGER.info("Investment Research web app available at http://%s:%s", args.host, args.port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
