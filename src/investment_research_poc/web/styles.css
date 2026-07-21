@@ -582,3 +582,33 @@ h2 {
 }
 
 [hidden] { display: none !important; }
+
+/* Footer: HR-facing disclaimer + portfolio back-link */
+.site-footer {
+  margin-top: 24px;
+  padding: 20px 4px 8px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  align-items: center;
+  justify-content: space-between;
+}
+.footer-disclaimer {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 0.82rem;
+  max-width: 60ch;
+}
+.footer-links {
+  margin: 0;
+  font-size: 0.85rem;
+}
+.footer-links a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+.footer-links a:hover {
+  text-decoration: underline;
+}

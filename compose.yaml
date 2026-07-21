@@ -1,0 +1,32 @@
+# Production stack: the app runs in a container and is published on the host's
+# loopback interface only. Your global nginx on the VPS terminates TLS and
+# reverse-proxies the subdomain to it.
+#
+#   invest.suthaharan.de  ->  nginx (:443, host)  ->  127.0.0.1:${APP_PORT}  ->  web :8080
+#
+# Start with:  docker compose up -d --build
+
+services:
+  web:
+    build: .
+    image: investment-research-web
+    restart: unless-stopped
+    # Secrets & rate-limit config come from .env (never commit this file).
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+    # Publish on loopback only: the host nginx proxies to this, the app is
+    # never exposed directly to the internet. Change the host port via APP_PORT.
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
