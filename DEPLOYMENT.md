@@ -74,20 +74,36 @@ usual tool (`certbot --nginx -d invest.suthaharan.de`):
 server {
     server_name invest.suthaharan.de;
 
+    # Cap the request body — the analysis payload is tiny; this blocks
+    # memory-exhaustion attempts (the app enforces the same 64 KiB limit).
+    client_max_body_size 64k;
+
+    # Security headers. The frontend loads only same-origin assets, so a strict
+    # CSP needs no 'unsafe-inline'. Uncomment HSTS only *after* TLS is live.
+    add_header X-Frame-Options            "DENY"                                   always;
+    add_header X-Content-Type-Options     "nosniff"                                always;
+    add_header Referrer-Policy            "strict-origin-when-cross-origin"        always;
+    add_header Content-Security-Policy    "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'" always;
+    # add_header Strict-Transport-Security "max-age=63072000; includeSubDomains"     always;
+
     location / {
         proxy_pass         http://127.0.0.1:8080;   # match APP_PORT
         proxy_set_header   Host              $host;
         proxy_set_header   X-Real-IP         $remote_addr;
-        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        # Overwrite (do NOT append with $proxy_add_x_forwarded_for): a client can
+        # otherwise pre-set X-Forwarded-For and rotate it to bypass per-IP limits.
+        proxy_set_header   X-Forwarded-For   $remote_addr;
         proxy_set_header   X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
     }
 
     # listen 443 ssl;  # added by certbot --nginx
 }
 ```
 
-The `X-Forwarded-For` header above is what feeds the app's per-IP rate limiting.
-Enable and reload:
+The `X-Forwarded-For` header above is what feeds the app's per-IP rate limiting;
+overwriting it with `$remote_addr` ensures visitors cannot spoof it. Enable and
+reload:
 
 ```bash
 sudo ln -s /etc/nginx/sites-available/invest.suthaharan.de /etc/nginx/sites-enabled/
