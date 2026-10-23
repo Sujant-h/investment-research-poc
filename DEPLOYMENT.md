@@ -1,5 +1,11 @@
 # Deployment – invest.suthaharan.de
 
+> **Hinweis: Das Produktiv-Deployment läuft inzwischen anders.** invest.suthaharan.de nutzt
+> das fertige Image `ghcr.io/sujant-h/investment-research-poc` (gebaut von
+> `.github/workflows/ci.yml`) und wird über das private Infrastruktur-Repo `vps-infra`
+> (Ansible) konfiguriert. Auf dem Server wird nichts mehr geklont oder gebaut. Die Anleitung
+> unten bleibt als Referenz für einen manuellen Betrieb.
+
 This guide deploys the Investment Research web app to a Linux VPS. The container
 is published on `127.0.0.1` only; your **existing global nginx** on the VPS
 terminates TLS and reverse-proxies the subdomain to it.
