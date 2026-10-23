@@ -267,8 +267,11 @@ async function handleSubmit(event) {
     });
     const result = await response.json();
     if (!response.ok) {
+      // Only the HTTP status (429 = rate limit), never the question itself.
+      track("analysis-error", { status: response.status, mode: symbolMode });
       throw new Error(result.error || "Die Analyse konnte nicht abgeschlossen werden.");
     }
+    track("analysis-run", { mode: symbolMode, symbols: selectedSymbols.length });
     state.currentRun = result;
     renderResults(result);
     setMessage("Analysebericht erfolgreich erstellt.", false);
@@ -471,4 +474,14 @@ function applySnapshot(snapshot) {
   fields.providerName.value = snapshot.providerName || "";
   setSelectedSymbols(snapshot.symbols || []);
   setSymbolMode(snapshot.symbolMode || state.defaults?.default_symbol_mode || "query");
+}
+
+// umami custom event. window.umami is missing locally and when the visitor
+// opts out (Do Not Track), so this is a no-op then. Never pass user input.
+function track(event, data) {
+  try {
+    window.umami?.track(event, data);
+  } catch {
+    // Analytics must never break the workspace.
+  }
 }

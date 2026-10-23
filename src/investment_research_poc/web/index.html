@@ -10,6 +10,11 @@
     >
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="stylesheet" href="/styles.css">
+    <!-- Self-hosted umami (vps-infra): nginx serves tracker and collect endpoint first-party under /u/,
+         so the CSP stays script-src/connect-src 'self'. data-domains keeps local runs out of the stats. -->
+    <script defer src="/u/s.js" data-website-id="2d427da0-c29d-4bd1-be7f-1f8af7992608" data-host-url="/u"
+            data-domains="invest.suthaharan.de" data-do-not-track="true" data-exclude-search="true"
+            data-exclude-hash="true"></script>
   </head>
   <body>
     <div class="app-shell">
